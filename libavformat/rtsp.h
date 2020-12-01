@@ -42,6 +42,7 @@ enum RTSPLowerTransport {
     RTSP_LOWER_TRANSPORT_HTTP = 8,          /**< HTTP tunneled - not a proper
                                                  transport mode as such,
                                                  only for use via AVOptions */
+    RTSP_LOWER_TRANSPORT_HTTPS,             /**< HTTPS tunneled */
     RTSP_LOWER_TRANSPORT_CUSTOM = 16,       /**< Custom IO - not a public
                                                  option for lower_transport_mask,
                                                  but set in the SDP demuxer based
@@ -77,6 +78,7 @@ enum RTSPControlTransport {
 #define RTSP_DEFAULT_AUDIO_SAMPLERATE 44100
 #define RTSP_RTP_PORT_MIN 5000
 #define RTSP_RTP_PORT_MAX 65000
+#define SDP_MAX_SIZE 16384
 
 /**
  * This describes a single item in the "Transport:" line of one stream as
@@ -314,7 +316,7 @@ typedef struct RTSPState {
     /** some MS RTSP streams contain a URL in the SDP that we need to use
      * for all subsequent RTSP requests, rather than the input URI; in
      * other cases, this is a copy of AVFormatContext->filename. */
-    char control_uri[1024];
+    char control_uri[2048];
 
     /** The following are used for parsing raw mpegts in udp */
     //@{
@@ -409,6 +411,7 @@ typedef struct RTSPState {
 
     char default_lang[4];
     int buffer_size;
+    int pkt_size;
 } RTSPState;
 
 #define RTSP_FLAG_FILTER_SRC  0x1    /**< Filter incoming UDP packets -

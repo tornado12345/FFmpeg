@@ -27,6 +27,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/eval.h"
+#include "libavutil/float_dsp.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
 
@@ -38,29 +39,47 @@
 #define MAX_SPLITS 16
 #define MAX_BANDS MAX_SPLITS + 1
 
+typedef struct BiquadCoeffs {
+    double b0, b1, b2;
+    double a1, a2;
+} BiquadCoeffs;
+
 typedef struct BiquadContext {
-    double a0, a1, a2;
-    double b1, b2;
-    double i1, i2;
-    double o1, o2;
+    double z1, z2;
 } BiquadContext;
 
 typedef struct CrossoverChannel {
-    BiquadContext lp[MAX_BANDS][4];
-    BiquadContext hp[MAX_BANDS][4];
+    BiquadContext lp[MAX_BANDS][20];
+    BiquadContext hp[MAX_BANDS][20];
+    BiquadContext ap[MAX_BANDS][MAX_BANDS][20];
 } CrossoverChannel;
 
 typedef struct AudioCrossoverContext {
     const AVClass *class;
 
     char *splits_str;
-    int order;
+    int order_opt;
+    float level_in;
 
+    int order;
     int filter_count;
+    int first_order;
+    int ap_filter_count;
     int nb_splits;
     float *splits;
 
+    BiquadCoeffs lp[MAX_BANDS][20];
+    BiquadCoeffs hp[MAX_BANDS][20];
+    BiquadCoeffs ap[MAX_BANDS][20];
+
     CrossoverChannel *xover;
+
+    AVFrame *input_frame;
+    AVFrame *frames[MAX_BANDS];
+
+    int (*filter_channels)(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs);
+
+    AVFloatDSPContext *fdsp;
 } AudioCrossoverContext;
 
 #define OFFSET(x) offsetof(AudioCrossoverContext, x)
@@ -68,10 +87,18 @@ typedef struct AudioCrossoverContext {
 
 static const AVOption acrossover_options[] = {
     { "split", "set split frequencies", OFFSET(splits_str), AV_OPT_TYPE_STRING, {.str="500"}, 0, 0, AF },
-    { "order", "set order",             OFFSET(order),      AV_OPT_TYPE_INT,    {.i64=1},     0, 2, AF, "m" },
+    { "order", "set order",             OFFSET(order_opt),  AV_OPT_TYPE_INT,    {.i64=1},     0, 9, AF, "m" },
     { "2nd",   "2nd order",             0,                  AV_OPT_TYPE_CONST,  {.i64=0},     0, 0, AF, "m" },
     { "4th",   "4th order",             0,                  AV_OPT_TYPE_CONST,  {.i64=1},     0, 0, AF, "m" },
-    { "8th",   "8th order",             0,                  AV_OPT_TYPE_CONST,  {.i64=2},     0, 0, AF, "m" },
+    { "6th",   "6th order",             0,                  AV_OPT_TYPE_CONST,  {.i64=2},     0, 0, AF, "m" },
+    { "8th",   "8th order",             0,                  AV_OPT_TYPE_CONST,  {.i64=3},     0, 0, AF, "m" },
+    { "10th",  "10th order",            0,                  AV_OPT_TYPE_CONST,  {.i64=4},     0, 0, AF, "m" },
+    { "12th",  "12th order",            0,                  AV_OPT_TYPE_CONST,  {.i64=5},     0, 0, AF, "m" },
+    { "14th",  "14th order",            0,                  AV_OPT_TYPE_CONST,  {.i64=6},     0, 0, AF, "m" },
+    { "16th",  "16th order",            0,                  AV_OPT_TYPE_CONST,  {.i64=7},     0, 0, AF, "m" },
+    { "18th",  "18th order",            0,                  AV_OPT_TYPE_CONST,  {.i64=8},     0, 0, AF, "m" },
+    { "20th",  "20th order",            0,                  AV_OPT_TYPE_CONST,  {.i64=9},     0, 0, AF, "m" },
+    { "level", "set input gain",        OFFSET(level_in),   AV_OPT_TYPE_FLOAT,  {.dbl=1},     0, 1, AF },
     { NULL }
 };
 
@@ -82,6 +109,10 @@ static av_cold int init(AVFilterContext *ctx)
     AudioCrossoverContext *s = ctx->priv;
     char *p, *arg, *saveptr = NULL;
     int i, ret = 0;
+
+    s->fdsp = avpriv_float_dsp_alloc(0);
+    if (!s->fdsp)
+        return AVERROR(ENOMEM);
 
     s->splits = av_calloc(MAX_SPLITS, sizeof(*s->splits));
     if (!s->splits)
@@ -96,7 +127,10 @@ static av_cold int init(AVFilterContext *ctx)
 
         p = NULL;
 
-        av_sscanf(arg, "%f", &freq);
+        if (av_sscanf(arg, "%f", &freq) != 1) {
+            av_log(ctx, AV_LOG_ERROR, "Invalid syntax for frequency[%d].\n", i);
+            return AVERROR(EINVAL);
+        }
         if (freq <= 0) {
             av_log(ctx, AV_LOG_ERROR, "Frequency %f must be positive number.\n", freq);
             return AVERROR(EINVAL);
@@ -131,81 +165,83 @@ static av_cold int init(AVFilterContext *ctx)
     return ret;
 }
 
-static void set_lp(BiquadContext *b, float fc, float q, float sr)
+static void set_lp(BiquadCoeffs *b, double fc, double q, double sr)
 {
-    double omega = (2.0 * M_PI * fc / sr);
-    double sn = sin(omega);
-    double cs = cos(omega);
-    double alpha = (sn / (2 * q));
-    double inv = (1.0 / (1.0 + alpha));
+    double omega = 2. * M_PI * fc / sr;
+    double cosine = cos(omega);
+    double alpha = sin(omega) / (2. * q);
 
-    b->a2 = b->a0 = (inv * (1.0 - cs) * 0.5);
-    b->a1 = b->a0 + b->a0;
-    b->b1 = -2. * cs * inv;
-    b->b2 = (1. - alpha) * inv;
+    double b0 = (1. - cosine) / 2.;
+    double b1 = 1. - cosine;
+    double b2 = (1. - cosine) / 2.;
+    double a0 = 1. + alpha;
+    double a1 = -2. * cosine;
+    double a2 = 1. - alpha;
+
+    b->b0 =  b0 / a0;
+    b->b1 =  b1 / a0;
+    b->b2 =  b2 / a0;
+    b->a1 = -a1 / a0;
+    b->a2 = -a2 / a0;
 }
 
-static void set_hp(BiquadContext *b, float fc, float q, float sr)
+static void set_hp(BiquadCoeffs *b, double fc, double q, double sr)
 {
-    double omega = 2 * M_PI * fc / sr;
-    double sn = sin(omega);
-    double cs = cos(omega);
-    double alpha = sn / (2 * q);
-    double inv = 1.0 / (1.0 + alpha);
+    double omega = 2. * M_PI * fc / sr;
+    double cosine = cos(omega);
+    double alpha = sin(omega) / (2. * q);
 
-    b->a0 = inv * (1. + cs) / 2.;
-    b->a1 = -2. * b->a0;
-    b->a2 = b->a0;
-    b->b1 = -2. * cs * inv;
-    b->b2 = (1. - alpha) * inv;
+    double b0 = (1. + cosine) / 2.;
+    double b1 = -1. - cosine;
+    double b2 = (1. + cosine) / 2.;
+    double a0 = 1. + alpha;
+    double a1 = -2. * cosine;
+    double a2 = 1. - alpha;
+
+    b->b0 =  b0 / a0;
+    b->b1 =  b1 / a0;
+    b->b2 =  b2 / a0;
+    b->a1 = -a1 / a0;
+    b->a2 = -a2 / a0;
 }
 
-static int config_input(AVFilterLink *inlink)
+static void set_ap(BiquadCoeffs *b, double fc, double q, double sr)
 {
-    AVFilterContext *ctx = inlink->dst;
-    AudioCrossoverContext *s = ctx->priv;
-    int ch, band, sample_rate = inlink->sample_rate;
-    double q;
+    double omega = 2. * M_PI * fc / sr;
+    double cosine = cos(omega);
+    double alpha = sin(omega) / (2. * q);
 
-    s->xover = av_calloc(inlink->channels, sizeof(*s->xover));
-    if (!s->xover)
-        return AVERROR(ENOMEM);
+    double a0 = 1. + alpha;
+    double a1 = -2. * cosine;
+    double a2 = 1. - alpha;
+    double b0 = a2;
+    double b1 = a1;
+    double b2 = a0;
 
-    switch (s->order) {
-    case 0:
-        q = 0.5;
-        s->filter_count = 1;
-        break;
-    case 1:
-        q = M_SQRT1_2;
-        s->filter_count = 2;
-        break;
-    case 2:
-        q = 0.54;
-        s->filter_count = 4;
-        break;
-    }
+    b->b0 =  b0 / a0;
+    b->b1 =  b1 / a0;
+    b->b2 =  b2 / a0;
+    b->a1 = -a1 / a0;
+    b->a2 = -a2 / a0;
+}
 
-    for (ch = 0; ch < inlink->channels; ch++) {
-        for (band = 0; band <= s->nb_splits; band++) {
-            set_lp(&s->xover[ch].lp[band][0], s->splits[band], q, sample_rate);
-            set_hp(&s->xover[ch].hp[band][0], s->splits[band], q, sample_rate);
+static void set_ap1(BiquadCoeffs *b, double fc, double sr)
+{
+    double omega = 2. * M_PI * fc / sr;
 
-            if (s->order > 1) {
-                set_lp(&s->xover[ch].lp[band][1], s->splits[band], 1.34, sample_rate);
-                set_hp(&s->xover[ch].hp[band][1], s->splits[band], 1.34, sample_rate);
-                set_lp(&s->xover[ch].lp[band][2], s->splits[band],    q, sample_rate);
-                set_hp(&s->xover[ch].hp[band][2], s->splits[band],    q, sample_rate);
-                set_lp(&s->xover[ch].lp[band][3], s->splits[band], 1.34, sample_rate);
-                set_hp(&s->xover[ch].hp[band][3], s->splits[band], 1.34, sample_rate);
-            } else {
-                set_lp(&s->xover[ch].lp[band][1], s->splits[band], q, sample_rate);
-                set_hp(&s->xover[ch].hp[band][1], s->splits[band], q, sample_rate);
-            }
-        }
-    }
+    b->a1 = exp(-omega);
+    b->a2 = 0.;
+    b->b0 = -b->a1;
+    b->b1 = 1.;
+    b->b2 = 0.;
+}
 
-    return 0;
+static void calc_q_factors(int order, double *q)
+{
+    double n = order / 2.;
+
+    for (int i = 0; i < n / 2; i++)
+        q[i] = 1. / (-2. * cos(M_PI * (2. * (i + 1) + n - 1.) / (2. * n)));
 }
 
 static int query_formats(AVFilterContext *ctx)
@@ -213,7 +249,7 @@ static int query_formats(AVFilterContext *ctx)
     AVFilterFormats *formats;
     AVFilterChannelLayouts *layouts;
     static const enum AVSampleFormat sample_fmts[] = {
-        AV_SAMPLE_FMT_DBLP,
+        AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_DBLP,
         AV_SAMPLE_FMT_NONE
     };
     int ret;
@@ -238,24 +274,182 @@ static int query_formats(AVFilterContext *ctx)
     return ff_set_common_samplerates(ctx, formats);
 }
 
-static double biquad_process(BiquadContext *b, double in)
+#define BIQUAD_PROCESS(name, type)                             \
+static void biquad_process_## name(const BiquadCoeffs *const c,\
+                                   BiquadContext *b,           \
+                                   type *dst, const type *src, \
+                                   int nb_samples)             \
+{                                                              \
+    const type b0 = c->b0;                                     \
+    const type b1 = c->b1;                                     \
+    const type b2 = c->b2;                                     \
+    const type a1 = c->a1;                                     \
+    const type a2 = c->a2;                                     \
+    type z1 = b->z1;                                           \
+    type z2 = b->z2;                                           \
+                                                               \
+    for (int n = 0; n + 1 < nb_samples; n++) {                 \
+        type in = src[n];                                      \
+        type out;                                              \
+                                                               \
+        out = in * b0 + z1;                                    \
+        z1 = b1 * in + z2 + a1 * out;                          \
+        z2 = b2 * in + a2 * out;                               \
+        dst[n] = out;                                          \
+                                                               \
+        n++;                                                   \
+        in = src[n];                                           \
+        out = in * b0 + z1;                                    \
+        z1 = b1 * in + z2 + a1 * out;                          \
+        z2 = b2 * in + a2 * out;                               \
+        dst[n] = out;                                          \
+    }                                                          \
+                                                               \
+    if (nb_samples & 1) {                                      \
+        const int n = nb_samples - 1;                          \
+        const type in = src[n];                                \
+        type out;                                              \
+                                                               \
+        out = in * b0 + z1;                                    \
+        z1 = b1 * in + z2 + a1 * out;                          \
+        z2 = b2 * in + a2 * out;                               \
+        dst[n] = out;                                          \
+    }                                                          \
+                                                               \
+    b->z1 = z1;                                                \
+    b->z2 = z2;                                                \
+}
+
+BIQUAD_PROCESS(fltp, float)
+BIQUAD_PROCESS(dblp, double)
+
+#define XOVER_PROCESS(name, type, one, ff)                                                  \
+static int filter_channels_## name(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs) \
+{                                                                                           \
+    AudioCrossoverContext *s = ctx->priv;                                                   \
+    AVFrame *in = s->input_frame;                                                           \
+    AVFrame **frames = s->frames;                                                           \
+    const int start = (in->channels * jobnr) / nb_jobs;                                     \
+    const int end = (in->channels * (jobnr+1)) / nb_jobs;                                   \
+    const int nb_samples = in->nb_samples;                                                  \
+                                                                                            \
+    for (int ch = start; ch < end; ch++) {                                                  \
+        const type *src = (const type *)in->extended_data[ch];                              \
+        CrossoverChannel *xover = &s->xover[ch];                                            \
+                                                                                            \
+        s->fdsp->vector_## ff ##mul_scalar((type *)frames[0]->extended_data[ch], src,       \
+                                    s->level_in, FFALIGN(nb_samples, sizeof(type)));        \
+                                                                                            \
+        for (int band = 0; band < ctx->nb_outputs; band++) {                                \
+            for (int f = 0; band + 1 < ctx->nb_outputs && f < s->filter_count; f++) {       \
+                const type *prv = (const type *)frames[band]->extended_data[ch];            \
+                type *dst = (type *)frames[band + 1]->extended_data[ch];                    \
+                const type *hsrc = f == 0 ? prv : dst;                                      \
+                BiquadContext *hp = &xover->hp[band][f];                                    \
+                BiquadCoeffs *hpc = &s->hp[band][f];                                        \
+                                                                                            \
+                biquad_process_## name(hpc, hp, dst, hsrc, nb_samples);                     \
+            }                                                                               \
+                                                                                            \
+            for (int f = 0; band + 1 < ctx->nb_outputs && f < s->filter_count; f++) {       \
+                type *dst = (type *)frames[band]->extended_data[ch];                        \
+                const type *lsrc = dst;                                                     \
+                BiquadContext *lp = &xover->lp[band][f];                                    \
+                BiquadCoeffs *lpc = &s->lp[band][f];                                        \
+                                                                                            \
+                biquad_process_## name(lpc, lp, dst, lsrc, nb_samples);                     \
+            }                                                                               \
+                                                                                            \
+            for (int aband = band + 1; aband + 1 < ctx->nb_outputs; aband++) {              \
+                if (s->first_order) {                                                       \
+                    const type *asrc = (const type *)frames[band]->extended_data[ch];       \
+                    type *dst = (type *)frames[band]->extended_data[ch];                    \
+                    BiquadContext *ap = &xover->ap[band][aband][0];                         \
+                    BiquadCoeffs *apc = &s->ap[aband][0];                                   \
+                                                                                            \
+                    biquad_process_## name(apc, ap, dst, asrc, nb_samples);                 \
+                }                                                                           \
+                                                                                            \
+                for (int f = s->first_order; f < s->ap_filter_count; f++) {                 \
+                    const type *asrc = (const type *)frames[band]->extended_data[ch];       \
+                    type *dst = (type *)frames[band]->extended_data[ch];                    \
+                    BiquadContext *ap = &xover->ap[band][aband][f];                         \
+                    BiquadCoeffs *apc = &s->ap[aband][f];                                   \
+                                                                                            \
+                    biquad_process_## name(apc, ap, dst, asrc, nb_samples);                 \
+                }                                                                           \
+            }                                                                               \
+        }                                                                                   \
+                                                                                            \
+        for (int band = 0; band < ctx->nb_outputs && s->first_order; band++) {              \
+            if (band & 1) {                                                                 \
+                type *dst = (type *)frames[band]->extended_data[ch];                        \
+                s->fdsp->vector_## ff ##mul_scalar(dst, dst, -one,                          \
+                                                   FFALIGN(nb_samples, sizeof(type)));      \
+            }                                                                               \
+        }                                                                                   \
+    }                                                                                       \
+                                                                                            \
+    return 0;                                                                               \
+}
+
+XOVER_PROCESS(fltp, float, 1.f, f)
+XOVER_PROCESS(dblp, double, 1.0, d)
+
+static int config_input(AVFilterLink *inlink)
 {
-    double out = in * b->a0 + b->i1 * b->a1 + b->i2 * b->a2 - b->o1 * b->b1 - b->o2 * b->b2;
+    AVFilterContext *ctx = inlink->dst;
+    AudioCrossoverContext *s = ctx->priv;
+    int sample_rate = inlink->sample_rate;
+    double q[16];
 
-    b->i2 = b->i1;
-    b->o2 = b->o1;
-    b->i1 = in;
-    b->o1 = out;
+    s->xover = av_calloc(inlink->channels, sizeof(*s->xover));
+    if (!s->xover)
+        return AVERROR(ENOMEM);
 
-    return out;
+    s->order = (s->order_opt + 1) * 2;
+    s->filter_count = s->order / 2;
+    s->first_order = s->filter_count & 1;
+    s->ap_filter_count = s->filter_count / 2 + s->first_order;
+    calc_q_factors(s->order, q);
+
+    for (int band = 0; band <= s->nb_splits; band++) {
+        if (s->first_order) {
+            set_lp(&s->lp[band][0], s->splits[band], 0.5, sample_rate);
+            set_hp(&s->hp[band][0], s->splits[band], 0.5, sample_rate);
+        }
+
+        for (int n = s->first_order; n < s->filter_count; n++) {
+            const int idx = s->filter_count / 2 - ((n + s->first_order) / 2 - s->first_order) - 1;
+
+            set_lp(&s->lp[band][n], s->splits[band], q[idx], sample_rate);
+            set_hp(&s->hp[band][n], s->splits[band], q[idx], sample_rate);
+        }
+
+        if (s->first_order)
+            set_ap1(&s->ap[band][0], s->splits[band], sample_rate);
+
+        for (int n = s->first_order; n < s->ap_filter_count; n++) {
+            const int idx = (s->filter_count / 2 - ((n * 2 + s->first_order) / 2 - s->first_order) - 1);
+
+            set_ap(&s->ap[band][n], s->splits[band], q[idx], sample_rate);
+        }
+    }
+
+    switch (inlink->format) {
+    case AV_SAMPLE_FMT_FLTP: s->filter_channels = filter_channels_fltp; break;
+    case AV_SAMPLE_FMT_DBLP: s->filter_channels = filter_channels_dblp; break;
+    }
+
+    return 0;
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *ctx = inlink->dst;
     AudioCrossoverContext *s = ctx->priv;
-    AVFrame *frames[MAX_BANDS] = { NULL };
-    int i, f, ch, band, ret = 0;
+    AVFrame **frames = s->frames;
+    int i, ret = 0;
 
     for (i = 0; i < ctx->nb_outputs; i++) {
         frames[i] = ff_get_audio_buffer(ctx->outputs[i], in->nb_samples);
@@ -271,39 +465,22 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     if (ret < 0)
         goto fail;
 
-    for (ch = 0; ch < inlink->channels; ch++) {
-        const double *src = (const double *)in->extended_data[ch];
-        CrossoverChannel *xover = &s->xover[ch];
-
-        for (band = 0; band < ctx->nb_outputs; band++) {
-            double *dst = (double *)frames[band]->extended_data[ch];
-
-            for (i = 0; i < in->nb_samples; i++) {
-                dst[i] = src[i];
-
-                for (f = 0; f < s->filter_count; f++) {
-                    if (band + 1 < ctx->nb_outputs) {
-                        BiquadContext *lp = &xover->lp[band][f];
-                        dst[i] = biquad_process(lp, dst[i]);
-                    }
-
-                    if (band - 1 >= 0) {
-                        BiquadContext *hp = &xover->hp[band - 1][f];
-                        dst[i] = biquad_process(hp, dst[i]);
-                    }
-                }
-            }
-        }
-    }
+    s->input_frame = in;
+    ctx->internal->execute(ctx, s->filter_channels, NULL, NULL, FFMIN(inlink->channels,
+                                                                      ff_filter_get_nb_threads(ctx)));
 
     for (i = 0; i < ctx->nb_outputs; i++) {
         ret = ff_filter_frame(ctx->outputs[i], frames[i]);
+        frames[i] = NULL;
         if (ret < 0)
             break;
     }
 
 fail:
+    for (i = 0; i < ctx->nb_outputs; i++)
+        av_frame_free(&frames[i]);
     av_frame_free(&in);
+    s->input_frame = NULL;
 
     return ret;
 }
@@ -313,7 +490,9 @@ static av_cold void uninit(AVFilterContext *ctx)
     AudioCrossoverContext *s = ctx->priv;
     int i;
 
+    av_freep(&s->fdsp);
     av_freep(&s->splits);
+    av_freep(&s->xover);
 
     for (i = 0; i < ctx->nb_outputs; i++)
         av_freep(&ctx->output_pads[i].name);
@@ -339,5 +518,6 @@ AVFilter ff_af_acrossover = {
     .query_formats  = query_formats,
     .inputs         = inputs,
     .outputs        = NULL,
-    .flags          = AVFILTER_FLAG_DYNAMIC_OUTPUTS,
+    .flags          = AVFILTER_FLAG_DYNAMIC_OUTPUTS |
+                      AVFILTER_FLAG_SLICE_THREADS,
 };

@@ -28,6 +28,7 @@
 #include <inttypes.h>
 
 #include "libavutil/imgutils.h"
+#include "libavutil/thread.h"
 
 #include "avcodec.h"
 #include "error_resilience.h"
@@ -388,9 +389,9 @@ static int rv20_decode_picture_header(RVDecContext *rv)
             // attempt to keep aspect during typical resolution switches
             if (!old_aspect.num)
                 old_aspect = (AVRational){1, 1};
-            if (2 * new_w * s->height == new_h * s->width)
+            if (2 * (int64_t)new_w * s->height == (int64_t)new_h * s->width)
                 s->avctx->sample_aspect_ratio = av_mul_q(old_aspect, (AVRational){2, 1});
-            if (new_w * s->height == 2 * new_h * s->width)
+            if ((int64_t)new_w * s->height == 2 * (int64_t)new_h * s->width)
                 s->avctx->sample_aspect_ratio = av_mul_q(old_aspect, (AVRational){1, 2});
 
             ret = ff_set_dimensions(s->avctx, new_w, new_h);
@@ -463,11 +464,22 @@ static int rv20_decode_picture_header(RVDecContext *rv)
     return s->mb_width * s->mb_height - mb_pos;
 }
 
+static av_cold void rv10_init_static(void)
+{
+        INIT_VLC_STATIC(&rv_dc_lum, DC_VLC_BITS, 256,
+                        rv_lum_bits, 1, 1,
+                        rv_lum_code, 2, 2, 16384);
+        INIT_VLC_STATIC(&rv_dc_chrom, DC_VLC_BITS, 256,
+                        rv_chrom_bits, 1, 1,
+                        rv_chrom_code, 2, 2, 16388);
+    ff_h263_decode_init_vlc();
+}
+
 static av_cold int rv10_decode_init(AVCodecContext *avctx)
 {
+    static AVOnce init_static_once = AV_ONCE_INIT;
     RVDecContext *rv = avctx->priv_data;
     MpegEncContext *s = &rv->m;
-    static int done = 0;
     int major_ver, minor_ver, micro_ver, ret;
 
     if (avctx->extradata_size < 8) {
@@ -525,18 +537,9 @@ static av_cold int rv10_decode_init(AVCodecContext *avctx)
         return ret;
 
     ff_h263dsp_init(&s->h263dsp);
-    ff_h263_decode_init_vlc();
 
-    /* init rv vlc */
-    if (!done) {
-        INIT_VLC_STATIC(&rv_dc_lum, DC_VLC_BITS, 256,
-                        rv_lum_bits, 1, 1,
-                        rv_lum_code, 2, 2, 16384);
-        INIT_VLC_STATIC(&rv_dc_chrom, DC_VLC_BITS, 256,
-                        rv_chrom_bits, 1, 1,
-                        rv_chrom_code, 2, 2, 16388);
-        done = 1;
-    }
+    /* init static VLCs */
+    ff_thread_once(&init_static_once, rv10_init_static);
 
     return 0;
 }
@@ -550,7 +553,7 @@ static av_cold int rv10_decode_end(AVCodecContext *avctx)
 }
 
 static int rv10_decode_packet(AVCodecContext *avctx, const uint8_t *buf,
-                              int buf_size, int buf_size2)
+                              int buf_size, int buf_size2, int whole_size)
 {
     RVDecContext *rv = avctx->priv_data;
     MpegEncContext *s = &rv->m;
@@ -579,6 +582,9 @@ static int rv10_decode_packet(AVCodecContext *avctx, const uint8_t *buf,
         av_log(s->avctx, AV_LOG_ERROR, "COUNT ERROR\n");
         return AVERROR_INVALIDDATA;
     }
+
+    if (whole_size < s->mb_width * s->mb_height / 8)
+        return AVERROR_INVALIDDATA;
 
     if ((s->mb_x == 0 && s->mb_y == 0) || !s->current_picture_ptr) {
         // FIXME write parser so we always have complete frames?
@@ -646,7 +652,7 @@ static int rv10_decode_packet(AVCodecContext *avctx, const uint8_t *buf,
 
         // Repeat the slice end check from ff_h263_decode_mb with our active
         // bitstream size
-        if (ret != SLICE_ERROR) {
+        if (ret != SLICE_ERROR && active_bits_size >= get_bits_count(&s->gb)) {
             int v = show_bits(&s->gb, 16);
 
             if (get_bits_count(&s->gb) + 16 > active_bits_size)
@@ -754,7 +760,7 @@ static int rv10_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             offset + FFMAX(size, size2) > buf_size)
             return AVERROR_INVALIDDATA;
 
-        if ((ret = rv10_decode_packet(avctx, buf + offset, size, size2)) < 0)
+        if ((ret = rv10_decode_packet(avctx, buf + offset, size, size2, buf_size)) < 0)
             return ret;
 
         if (ret > 8 * size)
@@ -798,6 +804,7 @@ AVCodec ff_rv10_decoder = {
     .close          = rv10_decode_end,
     .decode         = rv10_decode_frame,
     .capabilities   = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .max_lowres     = 3,
     .pix_fmts       = (const enum AVPixelFormat[]) {
         AV_PIX_FMT_YUV420P,
@@ -815,6 +822,7 @@ AVCodec ff_rv20_decoder = {
     .close          = rv10_decode_end,
     .decode         = rv10_decode_frame,
     .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .flush          = ff_mpeg_flush,
     .max_lowres     = 3,
     .pix_fmts       = (const enum AVPixelFormat[]) {

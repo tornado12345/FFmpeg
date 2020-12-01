@@ -34,6 +34,7 @@
 #include "thread.h"
 
 #define MIMIC_HEADER_SIZE   20
+#define MIMIC_VLC_BITS      11
 
 typedef struct MimicContext {
     AVCodecContext *avctx;
@@ -128,8 +129,7 @@ static av_cold int mimic_decode_end(AVCodecContext *avctx)
         av_frame_free(&ctx->frames[i].f);
     }
 
-    if (!avctx->internal->is_copy)
-        ff_free_vlc(&ctx->vlc);
+    ff_free_vlc(&ctx->vlc);
 
     return 0;
 }
@@ -139,12 +139,10 @@ static av_cold int mimic_decode_init(AVCodecContext *avctx)
     MimicContext *ctx = avctx->priv_data;
     int ret, i;
 
-    avctx->internal->allocate_progress = 1;
-
     ctx->prev_index = 0;
     ctx->cur_index  = 15;
 
-    if ((ret = init_vlc(&ctx->vlc, 11, FF_ARRAY_ELEMS(huffbits),
+    if ((ret = init_vlc(&ctx->vlc, MIMIC_VLC_BITS, FF_ARRAY_ELEMS(huffbits),
                         huffbits, 1, 1, huffcodes, 4, 4, 0)) < 0) {
         av_log(avctx, AV_LOG_ERROR, "error initializing vlc table\n");
         return ret;
@@ -157,10 +155,8 @@ static av_cold int mimic_decode_init(AVCodecContext *avctx)
 
     for (i = 0; i < FF_ARRAY_ELEMS(ctx->frames); i++) {
         ctx->frames[i].f = av_frame_alloc();
-        if (!ctx->frames[i].f) {
-            mimic_decode_end(avctx);
+        if (!ctx->frames[i].f)
             return AVERROR(ENOMEM);
-        }
     }
 
     return 0;
@@ -242,7 +238,7 @@ static int vlc_decode_block(MimicContext *ctx, int num_coeffs, int qscale)
         int value;
         int coeff;
 
-        vlc = get_vlc2(&ctx->gb, ctx->vlc.table, ctx->vlc.bits, 3);
+        vlc = get_vlc2(&ctx->gb, ctx->vlc.table, MIMIC_VLC_BITS, 3);
         if (!vlc) /* end-of-block code */
             return 0;
         if (vlc == -1)
@@ -451,24 +447,6 @@ static int mimic_decode_frame(AVCodecContext *avctx, void *data,
     return buf_size;
 }
 
-#if HAVE_THREADS
-static av_cold int mimic_init_thread_copy(AVCodecContext *avctx)
-{
-    MimicContext *ctx = avctx->priv_data;
-    int i;
-
-    for (i = 0; i < FF_ARRAY_ELEMS(ctx->frames); i++) {
-        ctx->frames[i].f = av_frame_alloc();
-        if (!ctx->frames[i].f) {
-            mimic_decode_end(avctx);
-            return AVERROR(ENOMEM);
-        }
-    }
-
-    return 0;
-}
-#endif
-
 AVCodec ff_mimic_decoder = {
     .name                  = "mimic",
     .long_name             = NULL_IF_CONFIG_SMALL("Mimic"),
@@ -480,5 +458,6 @@ AVCodec ff_mimic_decoder = {
     .decode                = mimic_decode_frame,
     .capabilities          = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
     .update_thread_context = ONLY_IF_THREADS_ENABLED(mimic_decode_update_thread_context),
-    .init_thread_copy      = ONLY_IF_THREADS_ENABLED(mimic_init_thread_copy),
+    .caps_internal         = FF_CODEC_CAP_ALLOCATE_PROGRESS |
+                             FF_CODEC_CAP_INIT_CLEANUP | FF_CODEC_CAP_INIT_THREADSAFE,
 };

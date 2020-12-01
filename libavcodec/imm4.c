@@ -33,6 +33,8 @@
 #include "idctdsp.h"
 #include "internal.h"
 
+#define CBPLO_VLC_BITS   6
+
 typedef struct IMM4Context {
     BswapDSPContext bdsp;
     GetBitContext  gb;
@@ -446,11 +448,13 @@ static int decode_frame(AVCodecContext *avctx, void *data,
         return AVERROR_PATCHWELCOME;
     }
 
-    if (!frame->key_frame &&
-        (avctx->width != width ||
-         avctx->height != height)) {
-        av_log(avctx, AV_LOG_ERROR, "Frame size change is unsupported.\n");
-        return AVERROR_INVALIDDATA;
+    if (avctx->width  != width ||
+        avctx->height != height) {
+        if (!frame->key_frame) {
+            av_log(avctx, AV_LOG_ERROR, "Frame size change is unsupported.\n");
+            return AVERROR_INVALIDDATA;
+        }
+        av_frame_unref(s->prev_frame);
     }
 
     ret = ff_set_dimensions(avctx, width, height);
@@ -486,8 +490,9 @@ static int decode_frame(AVCodecContext *avctx, void *data,
 
 static av_cold void imm4_init_static_data(void)
 {
-    INIT_VLC_SPARSE_STATIC(&cbplo_tab, 9, FF_ARRAY_ELEMS(cbplo_bits),
-                           cbplo_bits, 1, 1, cbplo_codes, 1, 1, cbplo_symbols, 1, 1, 512);
+    INIT_VLC_SPARSE_STATIC(&cbplo_tab, CBPLO_VLC_BITS, FF_ARRAY_ELEMS(cbplo_bits),
+                           cbplo_bits, 1, 1, cbplo_codes, 1, 1, cbplo_symbols, 1, 1,
+                           1 << CBPLO_VLC_BITS);
 
     INIT_VLC_SPARSE_STATIC(&cbphi_tab, 6, FF_ARRAY_ELEMS(cbphi_bits),
                            cbphi_bits, 1, 1, cbphi_codes, 1, 1, NULL, 0, 0, 64);
@@ -521,6 +526,13 @@ static av_cold int decode_init(AVCodecContext *avctx)
     return 0;
 }
 
+static void decode_flush(AVCodecContext *avctx)
+{
+    IMM4Context *s = avctx->priv_data;
+
+    av_frame_unref(s->prev_frame);
+}
+
 static av_cold int decode_close(AVCodecContext *avctx)
 {
     IMM4Context *s = avctx->priv_data;
@@ -541,6 +553,7 @@ AVCodec ff_imm4_decoder = {
     .init             = decode_init,
     .close            = decode_close,
     .decode           = decode_frame,
+    .flush            = decode_flush,
     .capabilities     = AV_CODEC_CAP_DR1,
     .caps_internal    = FF_CODEC_CAP_INIT_THREADSAFE |
                         FF_CODEC_CAP_INIT_CLEANUP,

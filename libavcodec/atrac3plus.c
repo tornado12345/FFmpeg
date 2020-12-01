@@ -81,8 +81,8 @@ av_cold void ff_atrac3p_init_vlcs(void)
 {
     int i, wl_vlc_offs, ct_vlc_offs, sf_vlc_offs, tab_offset;
 
-    static const int wl_nb_bits[4]  = { 2, 3, 5, 5 };
-    static const int wl_nb_codes[4] = { 3, 5, 8, 8 };
+    static const uint8_t wl_nb_bits[4]  = { 2, 3, 5, 5 };
+    static const uint8_t wl_nb_codes[4] = { 3, 5, 8, 8 };
     static const uint8_t * const wl_bits[4] = {
         atrac3p_wl_huff_bits1, atrac3p_wl_huff_bits2,
         atrac3p_wl_huff_bits3, atrac3p_wl_huff_bits4
@@ -95,8 +95,8 @@ av_cold void ff_atrac3p_init_vlcs(void)
         atrac3p_wl_huff_xlat1, atrac3p_wl_huff_xlat2, NULL, NULL
     };
 
-    static const int ct_nb_bits[4]  = { 3, 4, 4, 4 };
-    static const int ct_nb_codes[4] = { 4, 8, 8, 8 };
+    static const uint8_t ct_nb_bits[4]  = { 3, 4, 4, 4 };
+    static const uint8_t ct_nb_codes[4] = { 4, 8, 8, 8 };
     static const uint8_t * const ct_bits[4]  = {
         atrac3p_ct_huff_bits1, atrac3p_ct_huff_bits2,
         atrac3p_ct_huff_bits2, atrac3p_ct_huff_bits3
@@ -109,8 +109,8 @@ av_cold void ff_atrac3p_init_vlcs(void)
         NULL, NULL, atrac3p_ct_huff_xlat1, NULL
     };
 
-    static const int sf_nb_bits[8]  = {  9,  9,  9,  9,  6,  6,  7,  7 };
-    static const int sf_nb_codes[8] = { 64, 64, 64, 64, 16, 16, 16, 16 };
+    static const uint8_t sf_nb_bits[8]  = {  9,  9,  9,  9,  6,  6,  7,  7 };
+    static const uint8_t sf_nb_codes[8] = { 64, 64, 64, 64, 16, 16, 16, 16 };
     static const uint8_t  * const sf_bits[8]  = {
         atrac3p_sf_huff_bits1, atrac3p_sf_huff_bits1, atrac3p_sf_huff_bits2,
         atrac3p_sf_huff_bits3, atrac3p_sf_huff_bits4, atrac3p_sf_huff_bits4,
@@ -192,12 +192,12 @@ av_cold void ff_atrac3p_init_vlcs(void)
 
     /* build huffman tables for spectrum decoding */
     for (i = 0; i < 112; i++) {
-        if (atrac3p_spectra_tabs[i].cb)
+        if (atrac3p_spectra_tabs[i].redirect < 0)
             build_canonical_huff(atrac3p_spectra_tabs[i].cb,
                                  atrac3p_spectra_tabs[i].xlat,
                                  &tab_offset, &spec_vlc_tabs[i]);
-        else
-            spec_vlc_tabs[i].table = 0;
+        else /* Reuse already initialized VLC table */
+            spec_vlc_tabs[i] = spec_vlc_tabs[atrac3p_spectra_tabs[i].redirect];
     }
 
     /* build huffman tables for gain data decoding */
@@ -456,6 +456,10 @@ static int decode_channel_wordlen(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
     } else if (chan->fill_mode == 3) {
         pos = ch_num ? chan->num_coded_vals + chan->split_point
                      : ctx->num_quant_units - chan->split_point;
+        if (pos > FF_ARRAY_ELEMS(chan->qu_wordlen)) {
+            av_log(avctx, AV_LOG_ERROR, "Split point beyond array\n");
+            pos = FF_ARRAY_ELEMS(chan->qu_wordlen);
+        }
         for (i = chan->num_coded_vals; i < pos; i++)
             chan->qu_wordlen[i] = 1;
     }
@@ -875,10 +879,6 @@ static void decode_spectrum(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
 
                 tab_index = (chan->table_type * 8 + codetab) * 7 + wordlen - 1;
                 tab       = &atrac3p_spectra_tabs[tab_index];
-
-                /* this allows reusing VLC tables */
-                if (tab->redirect >= 0)
-                    tab_index = tab->redirect;
 
                 decode_qu_spectra(gb, tab, &spec_vlc_tabs[tab_index],
                                   &chan->spectrum[ff_atrac3p_qu_to_spec_pos[qu]],

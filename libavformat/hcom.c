@@ -25,7 +25,7 @@
 #include "internal.h"
 #include "pcm.h"
 
-static int hcom_probe(AVProbeData *p)
+static int hcom_probe(const AVProbeData *p)
 {
     if (p->buf_size < 132)
         return 0;
@@ -38,7 +38,7 @@ static int hcom_probe(AVProbeData *p)
 static int hcom_read_header(AVFormatContext *s)
 {
     AVStream *st;
-    unsigned data_size, rsrc_size, huffcount;
+    av_unused unsigned data_size, rsrc_size, huffcount;
     unsigned compresstype, divisor;
     unsigned dict_entries;
     int ret;

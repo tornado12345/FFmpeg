@@ -93,6 +93,14 @@ enum WidthType {
     NB_WTYPE,
 };
 
+enum TransformType {
+    DI,
+    DII,
+    TDII,
+    LATT,
+    NB_TTYPE,
+};
+
 typedef struct ChanCache {
     double i1, i2;
     double o1, o2;
@@ -106,37 +114,32 @@ typedef struct BiquadsContext {
     int width_type;
     int poles;
     int csg;
+    int transform_type;
+
+    int bypass;
 
     double gain;
     double frequency;
     double width;
+    double mix;
     uint64_t channels;
+    int normalize;
+    int order;
 
     double a0, a1, a2;
     double b0, b1, b2;
+
+    double oa0, oa1, oa2;
+    double ob0, ob1, ob2;
 
     ChanCache *cache;
     int block_align;
 
     void (*filter)(struct BiquadsContext *s, const void *ibuf, void *obuf, int len,
                    double *i1, double *i2, double *o1, double *o2,
-                   double b0, double b1, double b2, double a1, double a2, int *clippings);
+                   double b0, double b1, double b2, double a1, double a2, int *clippings,
+                   int disabled);
 } BiquadsContext;
-
-static av_cold int init(AVFilterContext *ctx)
-{
-    BiquadsContext *s = ctx->priv;
-
-    if (s->filter_type != biquad) {
-        if (s->frequency <= 0 || s->width <= 0) {
-            av_log(ctx, AV_LOG_ERROR, "Invalid frequency %f and/or width %f <= 0\n",
-                   s->frequency, s->width);
-            return AVERROR(EINVAL);
-        }
-    }
-
-    return 0;
-}
 
 static int query_formats(AVFilterContext *ctx)
 {
@@ -177,7 +180,8 @@ static void biquad_## name (BiquadsContext *s,                                \
                             double *in1, double *in2,                         \
                             double *out1, double *out2,                       \
                             double b0, double b1, double b2,                  \
-                            double a1, double a2, int *clippings)             \
+                            double a1, double a2, int *clippings,             \
+                            int disabled)                                     \
 {                                                                             \
     const type *ibuf = input;                                                 \
     type *obuf = output;                                                      \
@@ -185,6 +189,9 @@ static void biquad_## name (BiquadsContext *s,                                \
     double i2 = *in2;                                                         \
     double o1 = *out1;                                                        \
     double o2 = *out2;                                                        \
+    double wet = s->mix;                                                      \
+    double dry = 1. - wet;                                                    \
+    double out;                                                               \
     int i;                                                                    \
     a1 = -a1;                                                                 \
     a2 = -a2;                                                                 \
@@ -192,26 +199,32 @@ static void biquad_## name (BiquadsContext *s,                                \
     for (i = 0; i+1 < len; i++) {                                             \
         o2 = i2 * b2 + i1 * b1 + ibuf[i] * b0 + o2 * a2 + o1 * a1;            \
         i2 = ibuf[i];                                                         \
-        if (need_clipping && o2 < min) {                                      \
+        out = o2 * wet + i2 * dry;                                            \
+        if (disabled) {                                                       \
+            obuf[i] = i2;                                                     \
+        } else if (need_clipping && out < min) {                              \
             (*clippings)++;                                                   \
             obuf[i] = min;                                                    \
-        } else if (need_clipping && o2 > max) {                               \
+        } else if (need_clipping && out > max) {                              \
             (*clippings)++;                                                   \
             obuf[i] = max;                                                    \
         } else {                                                              \
-            obuf[i] = o2;                                                     \
+            obuf[i] = out;                                                    \
         }                                                                     \
         i++;                                                                  \
         o1 = i1 * b2 + i2 * b1 + ibuf[i] * b0 + o1 * a2 + o2 * a1;            \
         i1 = ibuf[i];                                                         \
-        if (need_clipping && o1 < min) {                                      \
+        out = o1 * wet + i1 * dry;                                            \
+        if (disabled) {                                                       \
+            obuf[i] = i1;                                                     \
+        } else if (need_clipping && out < min) {                              \
             (*clippings)++;                                                   \
             obuf[i] = min;                                                    \
-        } else if (need_clipping && o1 > max) {                               \
+        } else if (need_clipping && out > max) {                              \
             (*clippings)++;                                                   \
             obuf[i] = max;                                                    \
         } else {                                                              \
-            obuf[i] = o1;                                                     \
+            obuf[i] = out;                                                    \
         }                                                                     \
     }                                                                         \
     if (i < len) {                                                            \
@@ -220,14 +233,17 @@ static void biquad_## name (BiquadsContext *s,                                \
         i1 = ibuf[i];                                                         \
         o2 = o1;                                                              \
         o1 = o0;                                                              \
-        if (need_clipping && o0 < min) {                                      \
+        out = o0 * wet + i1 * dry;                                            \
+        if (disabled) {                                                       \
+            obuf[i] = i1;                                                     \
+        } else if (need_clipping && out < min) {                              \
             (*clippings)++;                                                   \
             obuf[i] = min;                                                    \
-        } else if (need_clipping && o0 > max) {                               \
+        } else if (need_clipping && out > max) {                              \
             (*clippings)++;                                                   \
             obuf[i] = max;                                                    \
         } else {                                                              \
-            obuf[i] = o0;                                                     \
+            obuf[i] = out;                                                    \
         }                                                                     \
     }                                                                         \
     *in1  = i1;                                                               \
@@ -241,6 +257,173 @@ BIQUAD_FILTER(s32, int32_t, INT32_MIN, INT32_MAX, 1)
 BIQUAD_FILTER(flt, float,   -1., 1., 0)
 BIQUAD_FILTER(dbl, double,  -1., 1., 0)
 
+#define BIQUAD_DII_FILTER(name, type, min, max, need_clipping)                \
+static void biquad_dii_## name (BiquadsContext *s,                            \
+                            const void *input, void *output, int len,         \
+                            double *z1, double *z2,                           \
+                            double *unused1, double *unused2,                 \
+                            double b0, double b1, double b2,                  \
+                            double a1, double a2, int *clippings,             \
+                            int disabled)                                     \
+{                                                                             \
+    const type *ibuf = input;                                                 \
+    type *obuf = output;                                                      \
+    double w1 = *z1;                                                          \
+    double w2 = *z2;                                                          \
+    double wet = s->mix;                                                      \
+    double dry = 1. - wet;                                                    \
+    double in, out, w0;                                                       \
+                                                                              \
+    a1 = -a1;                                                                 \
+    a2 = -a2;                                                                 \
+                                                                              \
+    for (int i = 0; i < len; i++) {                                           \
+        in = ibuf[i];                                                         \
+        w0 = in + a1 * w1 + a2 * w2;                                          \
+        out = b0 * w0 + b1 * w1 + b2 * w2;                                    \
+        w2 = w1;                                                              \
+        w1 = w0;                                                              \
+        out = out * wet + in * dry;                                           \
+        if (disabled) {                                                       \
+            obuf[i] = in;                                                     \
+        } else if (need_clipping && out < min) {                              \
+            (*clippings)++;                                                   \
+            obuf[i] = min;                                                    \
+        } else if (need_clipping && out > max) {                              \
+            (*clippings)++;                                                   \
+            obuf[i] = max;                                                    \
+        } else {                                                              \
+            obuf[i] = out;                                                    \
+        }                                                                     \
+    }                                                                         \
+    *z1 = w1;                                                                 \
+    *z2 = w2;                                                                 \
+}
+
+BIQUAD_DII_FILTER(s16, int16_t, INT16_MIN, INT16_MAX, 1)
+BIQUAD_DII_FILTER(s32, int32_t, INT32_MIN, INT32_MAX, 1)
+BIQUAD_DII_FILTER(flt, float,   -1., 1., 0)
+BIQUAD_DII_FILTER(dbl, double,  -1., 1., 0)
+
+#define BIQUAD_TDII_FILTER(name, type, min, max, need_clipping)               \
+static void biquad_tdii_## name (BiquadsContext *s,                           \
+                            const void *input, void *output, int len,         \
+                            double *z1, double *z2,                           \
+                            double *unused1, double *unused2,                 \
+                            double b0, double b1, double b2,                  \
+                            double a1, double a2, int *clippings,             \
+                            int disabled)                                     \
+{                                                                             \
+    const type *ibuf = input;                                                 \
+    type *obuf = output;                                                      \
+    double w1 = *z1;                                                          \
+    double w2 = *z2;                                                          \
+    double wet = s->mix;                                                      \
+    double dry = 1. - wet;                                                    \
+    double in, out;                                                           \
+                                                                              \
+    a1 = -a1;                                                                 \
+    a2 = -a2;                                                                 \
+                                                                              \
+    for (int i = 0; i < len; i++) {                                           \
+        in = ibuf[i];                                                         \
+        out = b0 * in + w1;                                                   \
+        w1 = b1 * in + w2 + a1 * out;                                         \
+        w2 = b2 * in + a2 * out;                                              \
+        out = out * wet + in * dry;                                           \
+        if (disabled) {                                                       \
+            obuf[i] = in;                                                     \
+        } else if (need_clipping && out < min) {                              \
+            (*clippings)++;                                                   \
+            obuf[i] = min;                                                    \
+        } else if (need_clipping && out > max) {                              \
+            (*clippings)++;                                                   \
+            obuf[i] = max;                                                    \
+        } else {                                                              \
+            obuf[i] = out;                                                    \
+        }                                                                     \
+    }                                                                         \
+    *z1 = w1;                                                                 \
+    *z2 = w2;                                                                 \
+}
+
+BIQUAD_TDII_FILTER(s16, int16_t, INT16_MIN, INT16_MAX, 1)
+BIQUAD_TDII_FILTER(s32, int32_t, INT32_MIN, INT32_MAX, 1)
+BIQUAD_TDII_FILTER(flt, float,   -1., 1., 0)
+BIQUAD_TDII_FILTER(dbl, double,  -1., 1., 0)
+
+#define BIQUAD_LATT_FILTER(name, type, min, max, need_clipping)               \
+static void biquad_latt_## name (BiquadsContext *s,                           \
+                           const void *input, void *output, int len,          \
+                           double *z1, double *z2,                            \
+                           double *unused1, double *unused2,                  \
+                           double v0, double v1, double v2,                   \
+                           double k0, double k1, int *clippings,              \
+                           int disabled)                                      \
+{                                                                             \
+    const type *ibuf = input;                                                 \
+    type *obuf = output;                                                      \
+    double s0 = *z1;                                                          \
+    double s1 = *z2;                                                          \
+    double wet = s->mix;                                                      \
+    double dry = 1. - wet;                                                    \
+    double in, out;                                                           \
+    double t0, t1;                                                            \
+                                                                              \
+    for (int i = 0; i < len; i++) {                                           \
+        out  = 0.;                                                            \
+        in   = ibuf[i];                                                       \
+        t0   = in - k1 * s0;                                                  \
+        t1   = t0 * k1 + s0;                                                  \
+        out += t1 * v2;                                                       \
+                                                                              \
+        t0    = t0 - k0 * s1;                                                 \
+        t1    = t0 * k0 + s1;                                                 \
+        out  += t1 * v1;                                                      \
+                                                                              \
+        out  += t0 * v0;                                                      \
+        s0    = t1;                                                           \
+        s1    = t0;                                                           \
+                                                                              \
+        out = out * wet + in * dry;                                           \
+        if (disabled) {                                                       \
+            obuf[i] = in;                                                     \
+        } else if (need_clipping && out < min) {                              \
+            (*clippings)++;                                                   \
+            obuf[i] = min;                                                    \
+        } else if (need_clipping && out > max) {                              \
+            (*clippings)++;                                                   \
+            obuf[i] = max;                                                    \
+        } else {                                                              \
+            obuf[i] = out;                                                    \
+        }                                                                     \
+    }                                                                         \
+    *z1 = s0;                                                                 \
+    *z2 = s1;                                                                 \
+}
+
+BIQUAD_LATT_FILTER(s16, int16_t, INT16_MIN, INT16_MAX, 1)
+BIQUAD_LATT_FILTER(s32, int32_t, INT32_MIN, INT32_MAX, 1)
+BIQUAD_LATT_FILTER(flt, float,   -1., 1., 0)
+BIQUAD_LATT_FILTER(dbl, double,  -1., 1., 0)
+
+static void convert_dir2latt(BiquadsContext *s)
+{
+    double k0, k1, v0, v1, v2;
+
+    k1 = s->a2;
+    k0 = s->a1 / (1. + k1);
+    v2 = s->b2;
+    v1 = s->b1 - v2 * s->a1;
+    v0 = s->b0 - v1 * k0 - v2 * k1;
+
+    s->a1 = k0;
+    s->a2 = k1;
+    s->b0 = v0;
+    s->b1 = v1;
+    s->b2 = v2;
+}
+
 static int config_filter(AVFilterLink *outlink, int reset)
 {
     AVFilterContext *ctx    = outlink->src;
@@ -248,14 +431,17 @@ static int config_filter(AVFilterLink *outlink, int reset)
     AVFilterLink *inlink    = ctx->inputs[0];
     double A = ff_exp10(s->gain / 40);
     double w0 = 2 * M_PI * s->frequency / inlink->sample_rate;
+    double K = tan(w0 / 2.);
     double alpha, beta;
 
-    if (w0 > M_PI) {
-        av_log(ctx, AV_LOG_ERROR,
-               "Invalid frequency %f. Frequency must be less than half the sample-rate %d.\n",
-               s->frequency, inlink->sample_rate);
-        return AVERROR(EINVAL);
+    s->bypass = (((w0 > M_PI || w0 <= 0.) && reset) || (s->width <= 0.)) && (s->filter_type != biquad);
+    if (s->bypass) {
+        av_log(ctx, AV_LOG_WARNING, "Invalid frequency and/or width!\n");
+        return 0;
     }
+
+    if ((w0 > M_PI || w0 <= 0.) && (s->filter_type != biquad))
+        return AVERROR(EINVAL);
 
     switch (s->width_type) {
     case NONE:
@@ -284,6 +470,12 @@ static int config_filter(AVFilterLink *outlink, int reset)
 
     switch (s->filter_type) {
     case biquad:
+        s->a0 = s->oa0;
+        s->a1 = s->oa1;
+        s->a2 = s->oa2;
+        s->b0 = s->ob0;
+        s->b1 = s->ob1;
+        s->b2 = s->ob2;
         break;
     case equalizer:
         s->a0 =   1 + alpha / A;
@@ -373,12 +565,24 @@ static int config_filter(AVFilterLink *outlink, int reset)
         }
         break;
     case allpass:
-        s->a0 =  1 + alpha;
-        s->a1 = -2 * cos(w0);
-        s->a2 =  1 - alpha;
-        s->b0 =  1 - alpha;
-        s->b1 = -2 * cos(w0);
-        s->b2 =  1 + alpha;
+        switch (s->order) {
+        case 1:
+            s->a0 = 1.;
+            s->a1 = -(1. - K) / (1. + K);
+            s->a2 = 0.;
+            s->b0 = s->a1;
+            s->b1 = s->a0;
+            s->b2 = 0.;
+            break;
+        case 2:
+            s->a0 =  1 + alpha;
+            s->a1 = -2 * cos(w0);
+            s->a2 =  1 - alpha;
+            s->b0 =  1 - alpha;
+            s->b1 = -2 * cos(w0);
+            s->b2 =  1 + alpha;
+        break;
+        }
         break;
     default:
         av_assert0(0);
@@ -393,21 +597,97 @@ static int config_filter(AVFilterLink *outlink, int reset)
     s->b2 /= s->a0;
     s->a0 /= s->a0;
 
+    if (s->normalize && fabs(s->b0 + s->b1 + s->b2) > 1e-6) {
+        double factor = (s->a0 + s->a1 + s->a2) / (s->b0 + s->b1 + s->b2);
+
+        s->b0 *= factor;
+        s->b1 *= factor;
+        s->b2 *= factor;
+    }
+
     s->cache = av_realloc_f(s->cache, sizeof(ChanCache), inlink->channels);
     if (!s->cache)
         return AVERROR(ENOMEM);
     if (reset)
         memset(s->cache, 0, sizeof(ChanCache) * inlink->channels);
 
-    switch (inlink->format) {
-    case AV_SAMPLE_FMT_S16P: s->filter = biquad_s16; break;
-    case AV_SAMPLE_FMT_S32P: s->filter = biquad_s32; break;
-    case AV_SAMPLE_FMT_FLTP: s->filter = biquad_flt; break;
-    case AV_SAMPLE_FMT_DBLP: s->filter = biquad_dbl; break;
-    default: av_assert0(0);
-    }
+    switch (s->transform_type) {
+    case DI:
+        switch (inlink->format) {
+        case AV_SAMPLE_FMT_S16P:
+            s->filter = biquad_s16;
+            break;
+        case AV_SAMPLE_FMT_S32P:
+            s->filter = biquad_s32;
+            break;
+        case AV_SAMPLE_FMT_FLTP:
+            s->filter = biquad_flt;
+            break;
+        case AV_SAMPLE_FMT_DBLP:
+            s->filter = biquad_dbl;
+            break;
+        default: av_assert0(0);
+        }
+        break;
+    case DII:
+        switch (inlink->format) {
+        case AV_SAMPLE_FMT_S16P:
+            s->filter = biquad_dii_s16;
+            break;
+        case AV_SAMPLE_FMT_S32P:
+            s->filter = biquad_dii_s32;
+            break;
+        case AV_SAMPLE_FMT_FLTP:
+            s->filter = biquad_dii_flt;
+            break;
+        case AV_SAMPLE_FMT_DBLP:
+            s->filter = biquad_dii_dbl;
+            break;
+        default: av_assert0(0);
+        }
+        break;
+    case TDII:
+        switch (inlink->format) {
+        case AV_SAMPLE_FMT_S16P:
+            s->filter = biquad_tdii_s16;
+            break;
+        case AV_SAMPLE_FMT_S32P:
+            s->filter = biquad_tdii_s32;
+            break;
+        case AV_SAMPLE_FMT_FLTP:
+            s->filter = biquad_tdii_flt;
+            break;
+        case AV_SAMPLE_FMT_DBLP:
+            s->filter = biquad_tdii_dbl;
+            break;
+        default: av_assert0(0);
+        }
+        break;
+    case LATT:
+        switch (inlink->format) {
+        case AV_SAMPLE_FMT_S16P:
+            s->filter = biquad_latt_s16;
+            break;
+        case AV_SAMPLE_FMT_S32P:
+            s->filter = biquad_latt_s32;
+            break;
+        case AV_SAMPLE_FMT_FLTP:
+            s->filter = biquad_latt_flt;
+            break;
+        case AV_SAMPLE_FMT_DBLP:
+            s->filter = biquad_latt_dbl;
+            break;
+        default: av_assert0(0);
+        }
+        break;
+    default:
+        av_assert0(0);
+     }
 
-    s->block_align = av_get_bytes_per_sample(inlink->format);
+     s->block_align = av_get_bytes_per_sample(inlink->format);
+
+     if (s->transform_type == LATT)
+         convert_dir2latt(s);
 
     return 0;
 }
@@ -442,7 +722,7 @@ static int filter_channel(AVFilterContext *ctx, void *arg, int jobnr, int nb_job
 
         s->filter(s, buf->extended_data[ch], out_buf->extended_data[ch], buf->nb_samples,
                   &s->cache[ch].i1, &s->cache[ch].i2, &s->cache[ch].o1, &s->cache[ch].o2,
-                  s->b0, s->b1, s->b2, s->a1, s->a2, &s->cache[ch].clippings);
+                  s->b0, s->b1, s->b2, s->a1, s->a2, &s->cache[ch].clippings, ctx->is_disabled);
     }
 
     return 0;
@@ -456,6 +736,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *buf)
     AVFrame *out_buf;
     ThreadData td;
     int ch;
+
+    if (s->bypass)
+        return ff_filter_frame(outlink, buf);
 
     if (av_frame_is_writable(buf)) {
         out_buf = buf;
@@ -488,118 +771,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *buf)
 static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
                            char *res, int res_len, int flags)
 {
-    BiquadsContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
+    int ret;
 
-    if ((!strcmp(cmd, "frequency") || !strcmp(cmd, "f")) &&
-        (s->filter_type == equalizer ||
-         s->filter_type == lowshelf  ||
-         s->filter_type == highshelf ||
-         s->filter_type == bass      ||
-         s->filter_type == treble    ||
-         s->filter_type == bandpass  ||
-         s->filter_type == bandreject||
-         s->filter_type == lowpass   ||
-         s->filter_type == highpass  ||
-         s->filter_type == allpass)) {
-        double freq;
-
-        if (sscanf(args, "%lf", &freq) != 1) {
-            av_log(ctx, AV_LOG_ERROR, "Invalid frequency value.\n");
-            return AVERROR(EINVAL);
-        }
-
-        s->frequency = freq;
-    } else if ((!strcmp(cmd, "gain") || !strcmp(cmd, "g")) &&
-        (s->filter_type == equalizer ||
-         s->filter_type == lowshelf  ||
-         s->filter_type == highshelf ||
-         s->filter_type == bass      ||
-         s->filter_type == treble)) {
-        double gain;
-
-        if (sscanf(args, "%lf", &gain) != 1) {
-            av_log(ctx, AV_LOG_ERROR, "Invalid gain value.\n");
-            return AVERROR(EINVAL);
-        }
-
-        s->gain = gain;
-    } else if ((!strcmp(cmd, "width") || !strcmp(cmd, "w")) &&
-        (s->filter_type == equalizer ||
-         s->filter_type == lowshelf  ||
-         s->filter_type == highshelf ||
-         s->filter_type == bass      ||
-         s->filter_type == treble    ||
-         s->filter_type == bandpass  ||
-         s->filter_type == bandreject||
-         s->filter_type == lowpass   ||
-         s->filter_type == highpass  ||
-         s->filter_type == allpass)) {
-        double width;
-
-        if (sscanf(args, "%lf", &width) != 1) {
-            av_log(ctx, AV_LOG_ERROR, "Invalid width value.\n");
-            return AVERROR(EINVAL);
-        }
-
-        s->width = width;
-    } else if ((!strcmp(cmd, "width_type") || !strcmp(cmd, "t")) &&
-        (s->filter_type == equalizer ||
-         s->filter_type == lowshelf  ||
-         s->filter_type == highshelf ||
-         s->filter_type == bass      ||
-         s->filter_type == treble    ||
-         s->filter_type == bandpass  ||
-         s->filter_type == bandreject||
-         s->filter_type == lowpass   ||
-         s->filter_type == highpass  ||
-         s->filter_type == allpass)) {
-        char width_type;
-
-        if (sscanf(args, "%c", &width_type) != 1) {
-            av_log(ctx, AV_LOG_ERROR, "Invalid width_type value.\n");
-            return AVERROR(EINVAL);
-        }
-
-        switch (width_type) {
-        case 'h': width_type = HERTZ;   break;
-        case 'q': width_type = QFACTOR; break;
-        case 'o': width_type = OCTAVE;  break;
-        case 's': width_type = SLOPE;   break;
-        case 'k': width_type = KHERTZ;  break;
-        default:
-            av_log(ctx, AV_LOG_ERROR, "Invalid width_type value: %c\n", width_type);
-            return AVERROR(EINVAL);
-        }
-
-        s->width_type = width_type;
-    } else if ((!strcmp(cmd, "a0") ||
-                !strcmp(cmd, "a1") ||
-                !strcmp(cmd, "a2") ||
-                !strcmp(cmd, "b0") ||
-                !strcmp(cmd, "b1") ||
-                !strcmp(cmd, "b2")) &&
-               s->filter_type == biquad) {
-        double value;
-
-        if (sscanf(args, "%lf", &value) != 1) {
-            av_log(ctx, AV_LOG_ERROR, "Invalid biquad value.\n");
-            return AVERROR(EINVAL);
-        }
-
-        if (!strcmp(cmd, "a0"))
-            s->a0 = value;
-        else if (!strcmp(cmd, "a1"))
-            s->a1 = value;
-        else if (!strcmp(cmd, "a2"))
-            s->a2 = value;
-        else if (!strcmp(cmd, "b0"))
-            s->b0 = value;
-        else if (!strcmp(cmd, "b1"))
-            s->b1 = value;
-        else if (!strcmp(cmd, "b2"))
-            s->b2 = value;
-    }
+    ret = ff_filter_process_command(ctx, cmd, args, res, res_len, flags);
+    if (ret < 0)
+        return ret;
 
     return config_filter(outlink, 0);
 }
@@ -630,19 +807,20 @@ static const AVFilterPad outputs[] = {
 };
 
 #define OFFSET(x) offsetof(BiquadsContext, x)
-#define FLAGS AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
+#define FLAGS AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
+#define AF AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
 
 #define DEFINE_BIQUAD_FILTER(name_, description_)                       \
 AVFILTER_DEFINE_CLASS(name_);                                           \
-static av_cold int name_##_init(AVFilterContext *ctx) \
+static av_cold int name_##_init(AVFilterContext *ctx)                   \
 {                                                                       \
     BiquadsContext *s = ctx->priv;                                      \
     s->class = &name_##_class;                                          \
     s->filter_type = name_;                                             \
-    return init(ctx);                                             \
+    return 0;                                                           \
 }                                                                       \
                                                          \
-AVFilter ff_af_##name_ = {                         \
+AVFilter ff_af_##name_ = {                               \
     .name          = #name_,                             \
     .description   = NULL_IF_CONFIG_SMALL(description_), \
     .priv_size     = sizeof(BiquadsContext),             \
@@ -653,7 +831,7 @@ AVFilter ff_af_##name_ = {                         \
     .outputs       = outputs,                            \
     .priv_class    = &name_##_class,                     \
     .process_command = process_command,                  \
-    .flags         = AVFILTER_FLAG_SLICE_THREADS,        \
+    .flags         = AVFILTER_FLAG_SLICE_THREADS | AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL, \
 }
 
 #if CONFIG_EQUALIZER_FILTER
@@ -671,8 +849,18 @@ static const AVOption equalizer_options[] = {
     {"w",     "set band-width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 99999, FLAGS},
     {"gain", "set gain", OFFSET(gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -900, 900, FLAGS},
     {"g",    "set gain", OFFSET(gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -900, 900, FLAGS},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 
@@ -693,8 +881,18 @@ static const AVOption bass_options[] = {
     {"w",     "set shelf transition steep", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0, 99999, FLAGS},
     {"gain", "set gain", OFFSET(gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -900, 900, FLAGS},
     {"g",    "set gain", OFFSET(gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -900, 900, FLAGS},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 
@@ -715,8 +913,18 @@ static const AVOption treble_options[] = {
     {"w",     "set shelf transition steep", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0, 99999, FLAGS},
     {"gain", "set gain", OFFSET(gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -900, 900, FLAGS},
     {"g",    "set gain", OFFSET(gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -900, 900, FLAGS},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 
@@ -736,8 +944,18 @@ static const AVOption bandpass_options[] = {
     {"width", "set band-width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0, 99999, FLAGS},
     {"w",     "set band-width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0, 99999, FLAGS},
     {"csg",   "use constant skirt gain", OFFSET(csg), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 
@@ -756,8 +974,18 @@ static const AVOption bandreject_options[] = {
     {"k", "kHz", 0, AV_OPT_TYPE_CONST, {.i64=KHERTZ}, 0, 0, FLAGS, "width_type"},
     {"width", "set band-width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0, 99999, FLAGS},
     {"w",     "set band-width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0, 99999, FLAGS},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 
@@ -776,10 +1004,20 @@ static const AVOption lowpass_options[] = {
     {"k", "kHz", 0, AV_OPT_TYPE_CONST, {.i64=KHERTZ}, 0, 0, FLAGS, "width_type"},
     {"width", "set width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.707}, 0, 99999, FLAGS},
     {"w",     "set width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.707}, 0, 99999, FLAGS},
-    {"poles", "set number of poles", OFFSET(poles), AV_OPT_TYPE_INT, {.i64=2}, 1, 2, FLAGS},
-    {"p",     "set number of poles", OFFSET(poles), AV_OPT_TYPE_INT, {.i64=2}, 1, 2, FLAGS},
+    {"poles", "set number of poles", OFFSET(poles), AV_OPT_TYPE_INT, {.i64=2}, 1, 2, AF},
+    {"p",     "set number of poles", OFFSET(poles), AV_OPT_TYPE_INT, {.i64=2}, 1, 2, AF},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 
@@ -798,10 +1036,20 @@ static const AVOption highpass_options[] = {
     {"k", "kHz", 0, AV_OPT_TYPE_CONST, {.i64=KHERTZ}, 0, 0, FLAGS, "width_type"},
     {"width", "set width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.707}, 0, 99999, FLAGS},
     {"w",     "set width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.707}, 0, 99999, FLAGS},
-    {"poles", "set number of poles", OFFSET(poles), AV_OPT_TYPE_INT, {.i64=2}, 1, 2, FLAGS},
-    {"p",     "set number of poles", OFFSET(poles), AV_OPT_TYPE_INT, {.i64=2}, 1, 2, FLAGS},
+    {"poles", "set number of poles", OFFSET(poles), AV_OPT_TYPE_INT, {.i64=2}, 1, 2, AF},
+    {"p",     "set number of poles", OFFSET(poles), AV_OPT_TYPE_INT, {.i64=2}, 1, 2, AF},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 
@@ -820,8 +1068,20 @@ static const AVOption allpass_options[] = {
     {"k", "kHz", 0, AV_OPT_TYPE_CONST, {.i64=KHERTZ}, 0, 0, FLAGS, "width_type"},
     {"width", "set filter-width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=707.1}, 0, 99999, FLAGS},
     {"w",     "set filter-width", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=707.1}, 0, 99999, FLAGS},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"order", "set filter order", OFFSET(order), AV_OPT_TYPE_INT, {.i64=2}, 1, 2, FLAGS},
+    {"o",     "set filter order", OFFSET(order), AV_OPT_TYPE_INT, {.i64=2}, 1, 2, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 
@@ -842,8 +1102,18 @@ static const AVOption lowshelf_options[] = {
     {"w",     "set shelf transition steep", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0, 99999, FLAGS},
     {"gain", "set gain", OFFSET(gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -900, 900, FLAGS},
     {"g",    "set gain", OFFSET(gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -900, 900, FLAGS},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 
@@ -864,8 +1134,18 @@ static const AVOption highshelf_options[] = {
     {"w",     "set shelf transition steep", OFFSET(width), AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0, 99999, FLAGS},
     {"gain", "set gain", OFFSET(gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -900, 900, FLAGS},
     {"g",    "set gain", OFFSET(gain), AV_OPT_TYPE_DOUBLE, {.dbl=0}, -900, 900, FLAGS},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 
@@ -873,14 +1153,24 @@ DEFINE_BIQUAD_FILTER(highshelf, "Apply a high shelf filter.");
 #endif  /* CONFIG_HIGHSHELF_FILTER */
 #if CONFIG_BIQUAD_FILTER
 static const AVOption biquad_options[] = {
-    {"a0", NULL, OFFSET(a0), AV_OPT_TYPE_DOUBLE, {.dbl=1}, INT32_MIN, INT32_MAX, FLAGS},
-    {"a1", NULL, OFFSET(a1), AV_OPT_TYPE_DOUBLE, {.dbl=0}, INT32_MIN, INT32_MAX, FLAGS},
-    {"a2", NULL, OFFSET(a2), AV_OPT_TYPE_DOUBLE, {.dbl=0}, INT32_MIN, INT32_MAX, FLAGS},
-    {"b0", NULL, OFFSET(b0), AV_OPT_TYPE_DOUBLE, {.dbl=0}, INT32_MIN, INT32_MAX, FLAGS},
-    {"b1", NULL, OFFSET(b1), AV_OPT_TYPE_DOUBLE, {.dbl=0}, INT32_MIN, INT32_MAX, FLAGS},
-    {"b2", NULL, OFFSET(b2), AV_OPT_TYPE_DOUBLE, {.dbl=0}, INT32_MIN, INT32_MAX, FLAGS},
+    {"a0", NULL, OFFSET(oa0), AV_OPT_TYPE_DOUBLE, {.dbl=1}, INT32_MIN, INT32_MAX, FLAGS},
+    {"a1", NULL, OFFSET(oa1), AV_OPT_TYPE_DOUBLE, {.dbl=0}, INT32_MIN, INT32_MAX, FLAGS},
+    {"a2", NULL, OFFSET(oa2), AV_OPT_TYPE_DOUBLE, {.dbl=0}, INT32_MIN, INT32_MAX, FLAGS},
+    {"b0", NULL, OFFSET(ob0), AV_OPT_TYPE_DOUBLE, {.dbl=0}, INT32_MIN, INT32_MAX, FLAGS},
+    {"b1", NULL, OFFSET(ob1), AV_OPT_TYPE_DOUBLE, {.dbl=0}, INT32_MIN, INT32_MAX, FLAGS},
+    {"b2", NULL, OFFSET(ob2), AV_OPT_TYPE_DOUBLE, {.dbl=0}, INT32_MIN, INT32_MAX, FLAGS},
+    {"mix", "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
+    {"m",   "set mix", OFFSET(mix), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 1, FLAGS},
     {"channels", "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
     {"c",        "set channels to filter", OFFSET(channels), AV_OPT_TYPE_CHANNEL_LAYOUT, {.i64=-1}, INT64_MIN, INT64_MAX, FLAGS},
+    {"normalize", "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"n",         "normalize coefficients", OFFSET(normalize), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+    {"transform", "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"a",         "set transform type", OFFSET(transform_type), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_TTYPE-1, AF, "transform_type"},
+    {"di",   "direct form I",  0, AV_OPT_TYPE_CONST, {.i64=DI}, 0, 0, AF, "transform_type"},
+    {"dii",  "direct form II", 0, AV_OPT_TYPE_CONST, {.i64=DII}, 0, 0, AF, "transform_type"},
+    {"tdii", "transposed direct form II", 0, AV_OPT_TYPE_CONST, {.i64=TDII}, 0, 0, AF, "transform_type"},
+    {"latt", "lattice-ladder form", 0, AV_OPT_TYPE_CONST, {.i64=LATT}, 0, 0, AF, "transform_type"},
     {NULL}
 };
 

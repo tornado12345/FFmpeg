@@ -55,7 +55,7 @@ void ff_h261_encode_picture_header(MpegEncContext *s, int picture_number)
     H261Context *h = (H261Context *)s;
     int format, temp_ref;
 
-    avpriv_align_put_bits(&s->pb);
+    align_put_bits(&s->pb);
 
     /* Update the pointer to last GOB */
     s->ptr_lastgob = put_bits_ptr(&s->pb);
@@ -394,6 +394,7 @@ AVCodec ff_h261_encoder = {
     .init           = ff_mpv_encode_init,
     .encode2        = ff_mpv_encode_picture,
     .close          = ff_mpv_encode_end,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .pix_fmts       = (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P,
                                                      AV_PIX_FMT_NONE },
     .priv_class     = &h261_class,

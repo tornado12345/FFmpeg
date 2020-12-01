@@ -62,7 +62,7 @@ static inline int mpc8_dec_enum(GetBitContext *gb, int k, int n)
     do {
         n--;
         if (code >= C[n]) {
-            bits |= 1 << n;
+            bits |= 1U << n;
             code -= C[n];
             C -= 32;
             k--;
@@ -119,8 +119,6 @@ static av_cold int mpc8_decode_init(AVCodecContext * avctx)
     memset(c->oldDSCF, 0, sizeof(c->oldDSCF));
     av_lfg_init(&c->rnd, 0xDEADBEEF);
     ff_mpadsp_init(&c->mpadsp);
-
-    ff_mpc_init();
 
     init_get_bits(&gb, avctx->extradata, 16);
 
@@ -232,6 +230,7 @@ static av_cold int mpc8_decode_init(AVCodecContext * avctx)
                  &mpc8_q8_codes[i], 1, 1, INIT_VLC_USE_NEW_STATIC);
     }
     vlc_initialized = 1;
+    ff_mpa_synth_init_fixed();
 
     return 0;
 }
@@ -364,8 +363,9 @@ static int mpc8_decode_frame(AVCodecContext * avctx, void *data,
                 for(j = 0; j < SAMPLES_PER_BAND; j += SAMPLES_PER_BAND / 2){
                     cnt = get_vlc2(gb, q1_vlc.table, MPC8_Q1_BITS, 2);
                     t = mpc8_get_mask(gb, 18, cnt);
-                    for(k = 0; k < SAMPLES_PER_BAND / 2; k++, t <<= 1)
-                        c->Q[ch][off + j + k] = (t & 0x20000) ? (get_bits1(gb) << 1) - 1 : 0;
+                    for(k = 0; k < SAMPLES_PER_BAND / 2; k++)
+                        c->Q[ch][off + j + k] = t & (1 << (SAMPLES_PER_BAND / 2 - k - 1))
+                                                ? (get_bits1(gb) << 1) - 1 : 0;
                 }
                 break;
             case 2:
@@ -383,7 +383,7 @@ static int mpc8_decode_frame(AVCodecContext * avctx, void *data,
                 for(j = 0; j < SAMPLES_PER_BAND; j += 2){
                     t = get_vlc2(gb, q3_vlc[res - 3].table, MPC8_Q3_BITS, 2) + q3_offsets[res - 3];
                     c->Q[ch][off + j + 1] = t >> 4;
-                    c->Q[ch][off + j + 0] = (t & 8) ? (t & 0xF) - 16 : (t & 0xF);
+                    c->Q[ch][off + j + 0] = sign_extend(t, 4);
                 }
                 break;
             case 5:
